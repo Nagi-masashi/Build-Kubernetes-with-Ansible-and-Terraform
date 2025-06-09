@@ -1,0 +1,20 @@
+---
+your_workerkey_dir: /Users/nagi/ssh_key/terra-k8s-work
+
+your_controllerkey_dir: /Users/nagi/ssh_key/terra-k8s-cont
+
+first_playbook_dir: /Users/nagi/ansible/bastion_ansible/c_main.yml
+
+second_playbook_dir: /Users/nagi/ansible/bastion_ansible/controller.yaml
+
+third_playbook_dir: /Users/nagi/ansible/bastion_ansible/worker.yaml
+
+fourth_playbook_dir: /Users/nagi/ansible/bastion_ansible/c_main_last.yml
+
+encryption_config_dir: /Users/nagi/ansible/bastion_ansible/encryption-config.yaml
+
+variables_dir: /Users/nagi/ansible/bastion_ansible/variables.yml
+
+initfile_dir: /Users/nagi/ansible/bastion_ansible/remote_inventory.ini
+
+cfgfile_dir: /Users/nagi/ansible/bastion_ansible/ansible.cfg

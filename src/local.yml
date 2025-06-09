@@ -1,0 +1,89 @@
+---
+- hosts: remote_server
+  gather_facts: no
+  vars_files:
+    - main_variables.yml
+  tasks:
+
+  - name: check if file exists
+    stat:
+      path: /usr/bin/ansible
+    register: file_status
+
+  - name: apt update
+    become: true
+    ansible.builtin.apt:
+      update_cache: true
+      force_apt_get: true
+      cache_valid_time: 3600
+
+  - name: apt install software-properties-common
+    become: true
+    ansible.builtin.apt: 
+      name: software-properties-common
+      state: present
+
+  - name: apt-add-repository --yes --update ppa:ansible/ansible
+    become: yes
+    ansible.builtin.apt_repository: 
+      repo: ppa:ansible/ansible
+    when: not file_status.stat.exists
+
+  - name: install ansible
+    become: true
+    ansible.builtin.apt:
+      name: ansible
+      state: present
+    when: not file_status.stat.exists
+
+  - name: copy ssh_key_file to vm
+    ansible.builtin.copy:
+      src: "{{ your_workerkey_dir }}"
+      dest: ./
+      mode: 0600
+
+  - name: copy ssh_key_file to vm
+    ansible.builtin.copy:
+      src: "{{ your_controllerkey_dir }}"
+      dest: ./
+      mode: 0600
+
+  - name: create k8s file to bastion
+    ansible.builtin.copy:
+      src: "{{ first_playbook_dir }}"
+      dest: ./
+    
+  - name: create controller file to bastion
+    ansible.builtin.copy:
+      src: "{{ second_playbook_dir }}"
+      dest: ./
+
+  - name: create worker file to bastion
+    ansible.builtin.copy:
+      src: "{{ third_playbook_dir }}"
+      dest: ./
+
+  - name: create c_main_last file to bastion
+    ansible.builtin.copy:
+      src: "{{ fourth_playbook_dir }}"
+      dest: ./
+
+  - name: copy encryption file to bastion
+    ansible.builtin.copy:
+      src: "{{ encryption_config_dir }}"
+      dest: ./
+
+  - name: create k8s_variable_file to bastion
+    ansible.builtin.copy:
+      src: "{{ variables_dir }}"
+      dest: ./
+
+  - name: create k8s_init_file to bastion
+    ansible.builtin.copy:
+      src: "{{ initfile_dir }}"
+      dest: ./
+      
+  - name: create ansible.cfg to bastion
+    ansible.builtin.copy:
+      src: "{{ cfgfile_dir }}"
+      dest: ./

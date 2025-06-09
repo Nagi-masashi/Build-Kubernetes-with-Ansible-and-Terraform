@@ -1,0 +1,51 @@
+---
+- name: Run command in Azure Linux VM
+  hosts: remote_server
+  gather_facts: no
+  vars_files:
+    - variables.yml
+
+  tasks:
+    - name: Create terra-k8s-worker-csr.json
+      copy:
+        dest: ./terra-k8s-worker-csr.json
+        content: {
+          "CN": "admin",
+          "key": {
+            "algo": "rsa",
+            "size": 2048
+          },
+          "names": [
+            {
+              "C": "{{ region }}",
+              "L": "Portland",
+              "O": "system:masters",
+              "OU": "Kubernetes The Hard Way",
+              "ST": "{{ city }}"
+            }
+          ]
+        }
+
+    - name: Run a shell command kubelet-Cert
+      shell: cfssl gencert \
+        -ca=ca.pem \
+        -ca-key=ca-key.pem \
+        -config=ca-config.json \
+        -hostname=terra-k8s-worker-0,"{{ Worker_privateIP }}" \
+        -profile=kubernetes \
+        terra-k8s-worker-csr.json | cfssljson -bare terra-k8s-worker-0
+    
+    - name: Copy files from bastion to worker
+      hosts: worker_server
+      user: terra-k8s-work
+      tasks:
+        - name: Copy files from bastion to worker
+          tags: sync-push
+          synchronize:
+            src: ./ca.pem
+            dest: ./
+            mode: push
+          delegate_to: remote_server
+          register: syncfile
+          with_items:
+            "./ca.pem"

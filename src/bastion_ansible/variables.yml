@@ -1,0 +1,9 @@
+---
+region: "JP"
+city: "Tokyo"
+Controller_privateIP: 10.0.10.10
+Worker_privateIP: 10.0.20.10
+Your_controller_key_file_dir: /home/terra-bas/terra-k8s-cont
+Your_worker_key_file_dir: /home/terra-bas/terra-k8s-work
+cont_name: terra-k8s-cont
+worker_name: terra-k8s-work

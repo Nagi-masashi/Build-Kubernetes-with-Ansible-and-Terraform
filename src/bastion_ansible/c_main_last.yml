@@ -1,0 +1,118 @@
+---
+- name: Run command in Azure Linux VM
+  hosts: localhost
+  gather_facts: no
+  vars_files:
+    - variables.yml
+
+  tasks:
+    - name: Configure Kubectl for remote access (host)
+      ansible.builtin.shell: |
+        kubectl config set-cluster kubernetes-the-hard-way \
+        --certificate-authority=ca.pem \
+        --embed-certs=true \
+        --server=https://{{ Controller_privateIP }}:6443
+
+        kubectl config set-credentials admin \
+            --client-certificate=admin.pem \
+            --client-key=admin-key.pem
+
+        kubectl config set-context kubernetes-the-hard-way \
+            --cluster=kubernetes-the-hard-way \
+            --user=admin
+
+        kubectl config use-context kubernetes-the-hard-way
+
+    - name: wget https://raw.githubusercontent.com/antrea-io/antrea/main/build/yamls/antrea.yml
+      ansible.builtin.get_url: 
+        dest: ./
+        url: https://raw.githubusercontent.com/antrea-io/antrea/main/build/yamls/antrea.yml
+
+    - name: enable antrea.yml
+      ansible.builtin.shell: | 
+        sed -i 's/apiVersions:.*/apiVersions: ["v1"]/' antrea.yml
+        sed -i 's/#\s*Traceflow:\s*true/Traceflow: true/' antrea.yml
+        sed -i 's/#\s*AntreaProxy:\s*true/AntreaProxy: true/' antrea.yml
+
+    - name: Apply antrea.yaml
+      ansible.builtin.command: kubectl apply -f antrea.yml
+
+    - name: Deploying the DNS Cluster Add-on(host)
+      ansible.builtin.command: kubectl apply -f https://storage.googleapis.com/kubernetes-the-hard-way/coredns-1.8.yaml
+
+    - name: Octant and antrea-octant-plugin installation
+      ansible.builtin.get_url:
+        dest: ./
+        url: https://raw.githubusercontent.com/antrea-io/antrea/main/build/yamls/antrea-octant.yml
+
+    - name: admin.kubeconfig's server change kubernetes_public_ip
+      ansible.builtin.command: cp admin.kubeconfig octant.kubeconfig
+
+    - name: admin.kubeconfig's server change kubernetes_public_ip
+      ansible.builtin.command: sed -i -e 's|https://127.0.0.1:6443|{{ Controller_privateIP }}|g' octant.kubeconfig
+
+    - name: admin.kubeconfig's server change kubernetes_public_ip
+      ansible.builtin.command: kubectl create secret generic octant-kubeconfig --from-file=admin.conf=octant.kubeconfig -n kube-system
+      
+    - name: apply antrea-octant-plugin
+      ansible.builtin.command: kubectl apply -f antrea-octant.yml
+
+    - name: install nginx
+      ansible.builtin.get_url:
+        dest: ./
+        url: "https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.6.4/deploy/static/provider/cloud/deploy.yaml"
+
+    - name: edit file
+      ansible.builtin.command: sed -i '637 s/v1/v1beta1/g' deploy.yaml
+
+    - name: apply deploy.yml
+      ansible.builtin.command: kubectl apply -f deploy.yaml
+
+    - name: nginx running
+      ansible.builtin.shell: |
+        kubectl run nginx --image=nginx
+        kubectl run web --image=httpd:2.4.48-alpine3.14
+        kubectl expose pod nginx --port=80 --type=NodePort --name=nginx-service
+        kubectl expose pod web --port=5000 --target-port=80 --type=NodePort --name=web-server-service
+
+    - name: nginx-ingress.yaml
+      ansible.builtin.copy:
+        dest: ./nginx-ingress.yaml
+        content: |
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: nginx-ingress
+            annotations:
+              nginx.ingress.kubernetes.io/rewrite-target: /
+          spec:
+            ingressClassName: nginx
+            defaultBackend:
+              service:
+                name: nginx-service
+                port:
+                  number: 80
+            rules:
+            - host: nginx.example.com
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: nginx-service
+                      port:
+                        number: 80
+            - host: web.example.com
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: web-server-service
+                      port:
+                        number: 5000
+
+    - name: kubectl apply -f nginx-ingress.yaml
+      ansible.builtin.command: kubectl apply -f nginx-ingress.yaml

@@ -1,0 +1,285 @@
+---
+- hosts: controller_node
+  gather_facts: no
+  vars_files:
+    - variables.yml
+  tasks:
+
+    - name: Download and Install the etcd Binaries
+      ansible.builtin.get_url:
+        backup: true
+        url: "https://github.com/etcd-io/etcd/releases/download/v3.4.15/etcd-v3.4.15-linux-amd64.tar.gz"
+        dest: ./
+
+    - name: check if file exists
+      become: yes
+      stat:
+        path: /etc/etcd
+      register: file_status
+
+    - name: etcd move to bin
+      ansible.builtin.shell: |
+        tar -xvf etcd-v3.4.15-linux-amd64.tar.gz
+
+        sudo mv etcd-v3.4.15-linux-amd64/etcd* /usr/local/bin/
+
+        sudo mkdir -p /etc/etcd /var/lib/etcd
+
+        sudo chmod 700 /var/lib/etcd
+
+        sudo cp ca.pem kubernetes-key.pem kubernetes.pem /etc/etcd/
+      # when: not file_status.stat.exists
+
+    - name: create etcd.service
+      become: yes
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/etcd.service
+        content: |
+          [Unit]
+          Description=etcd
+          Documentation=https://github.com/coreos
+
+          [Service]
+          Type=notify
+          ExecStart=/usr/local/bin/etcd \
+            --name {{ cont_name }} \
+            --cert-file=/etc/etcd/kubernetes.pem \
+            --key-file=/etc/etcd/kubernetes-key.pem \
+            --peer-cert-file=/etc/etcd/kubernetes.pem \
+            --peer-key-file=/etc/etcd/kubernetes-key.pem \
+            --trusted-ca-file=/etc/etcd/ca.pem \
+            --peer-trusted-ca-file=/etc/etcd/ca.pem \
+            --peer-client-cert-auth \
+            --client-cert-auth \
+            --initial-advertise-peer-urls https://{{ Controller_privateIP }}:2380 \
+            --listen-peer-urls https://{{ Controller_privateIP }}:2380 \
+            --listen-client-urls https://{{ Controller_privateIP }}:2379,https://127.0.0.1:2379 \
+            --advertise-client-urls https://{{ Controller_privateIP }}:2379 \
+            --initial-cluster-token etcd-cluster-0 \
+            --initial-cluster {{ cont_name }}=https://{{ Controller_privateIP }}:2380 \
+            --initial-cluster-state new \
+            --data-dir=/var/lib/etcd
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: daemon-reload
+      become: yes
+      ansible.builtin.command: systemctl daemon-reload
+
+    - name: sudo systemctl enable etcd
+      become: yes
+      ansible.builtin.command: sudo systemctl enable etcd
+
+    - name: sudo systemctl start etcd
+      become: yes
+      ansible.builtin.command: sudo systemctl start etcd
+
+    - name: Check if dir exists
+      stat:
+        path: /etc/kubernetes/config
+      register: dir_status
+    
+    - name: mkdir
+      ansible.builtin.command: sudo mkdir -p /etc/kubernetes/config
+      when: not dir_status.stat.exists
+
+    - name: Download and Install the Kubernetes Controller Binaries
+      ansible.builtin.command:  
+        wget -q --show-progress --https-only --timestamping "https://storage.googleapis.com/kubernetes-release/release/v1.24.0/bin/linux/amd64/kube-apiserver" "https://storage.googleapis.com/kubernetes-release/release/v1.24.0/bin/linux/amd64/kube-controller-manager" "https://storage.googleapis.com/kubernetes-release/release/v1.24.0/bin/linux/amd64/kube-scheduler" "https://storage.googleapis.com/kubernetes-release/release/v1.24.0/bin/linux/amd64/kubectl"
+
+    - name: Check if dir exists
+      stat:
+        path: /usr/local/bin/kubectl
+      register: file_status2
+
+    - name: move to each directory
+      become: yes
+      ansible.builtin.command:
+        chmod +x kube-apiserver kube-controller-manager kube-scheduler kubectl
+      when: not file_status2.stat.exists
+    
+    - name: move to each directory
+      become: yes
+      ansible.builtin.command:
+        mv kube-apiserver kube-controller-manager kube-scheduler kubectl /usr/local/bin/
+      when: not file_status2.stat.exists
+
+    - name: Configure the Kubernetes API Server
+      ansible.builtin.command: sudo mkdir -p /var/lib/kubernetes
+
+    - name: Configure the Kubernetes API Server
+      become: yes
+      ansible.builtin.command: mv ca.pem ca-key.pem kubernetes-key.pem kubernetes.pem service-account-key.pem service-account.pem encryption-config.yaml /var/lib/kubernetes/
+
+    - name: create api-server
+      become: yes
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/kube-apiserver.service
+        content: |
+          [Unit]
+          Description=Kubernetes API Server
+          Documentation=https://github.com/kubernetes/kubernetes
+
+          [Service]
+          ExecStart=/usr/local/bin/kube-apiserver \
+            --advertise-address={{ Controller_privateIP }} \
+            --allow-privileged=true \
+            --apiserver-count=3 \
+            --audit-log-maxage=30 \
+            --audit-log-maxbackup=3 \
+            --audit-log-maxsize=100 \
+            --audit-log-path=/var/log/audit.log \
+            --authorization-mode=Node,RBAC \
+            --bind-address=0.0.0.0 \
+            --client-ca-file=/var/lib/kubernetes/ca.pem \
+            --enable-admission-plugins=NamespaceLifecycle,NodeRestriction,LimitRanger,ServiceAccount,DefaultStorageClass,ResourceQuota \
+            --etcd-cafile=/var/lib/kubernetes/ca.pem \
+            --etcd-certfile=/var/lib/kubernetes/kubernetes.pem \
+            --etcd-keyfile=/var/lib/kubernetes/kubernetes-key.pem \
+            --etcd-servers=https://{{ Controller_privateIP }}:2379 \
+            --event-ttl=1h \
+            --encryption-provider-config=/var/lib/kubernetes/encryption-config.yaml \
+            --kubelet-certificate-authority=/var/lib/kubernetes/ca.pem \
+            --kubelet-client-certificate=/var/lib/kubernetes/kubernetes.pem \
+            --kubelet-client-key=/var/lib/kubernetes/kubernetes-key.pem \
+            --runtime-config='api/all=true' \
+            --service-account-key-file=/var/lib/kubernetes/service-account.pem \
+            --service-account-signing-key-file=/var/lib/kubernetes/service-account-key.pem \
+            --service-account-issuer=https://{{ Controller_privateIP }}:6443 \
+            --service-cluster-ip-range=10.32.0.0/24 \
+            --service-node-port-range=30000-32767 \
+            --tls-cert-file=/var/lib/kubernetes/kubernetes.pem \
+            --tls-private-key-file=/var/lib/kubernetes/kubernetes-key.pem \
+            --requestheader-client-ca-file=/var/lib/kubernetes/ca.pem \
+            --enable-aggregator-routing="true" \
+            --v=2
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: mv kube-controller-manager
+      ansible.builtin.command: sudo mv kube-controller-manager.kubeconfig /var/lib/kubernetes/
+
+    - name: Configure the Kubernetes Controller Manager
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/kube-controller-manager.service
+        content: |
+          [Unit]
+          Description=Kubernetes Controller Manager
+          Documentation=https://github.com/kubernetes/kubernetes
+
+          [Service]
+          ExecStart=/usr/local/bin/kube-controller-manager \
+          --bind-address=0.0.0.0 \
+          --cluster-cidr=172.100.0.0/16 \
+          --cluster-name=kubernetes \
+          --cluster-signing-cert-file=/var/lib/kubernetes/ca.pem \
+          --cluster-signing-key-file=/var/lib/kubernetes/ca-key.pem \
+          --kubeconfig=/var/lib/kubernetes/kube-controller-manager.kubeconfig \
+          --leader-elect=true \
+          --root-ca-file=/var/lib/kubernetes/ca.pem \
+          --service-account-private-key-file=/var/lib/kubernetes/service-account-key.pem \
+          --service-cluster-ip-range=10.32.0.0/24 \
+          --use-service-account-credentials=true \
+          --allocate-node-cidrs=true \
+          --v=2
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+      become: yes
+
+    - name: mv kube-scheduler.kubeconfig /var/lib/kubernetes/
+      ansible.builtin.command: sudo mv kube-scheduler.kubeconfig /var/lib/kubernetes/
+
+    - name: create kube-scheduler.yaml
+      become: yes
+      ansible.builtin.copy:
+        dest: /etc/kubernetes/config/kube-scheduler.yaml
+        content: |
+          apiVersion: kubescheduler.config.k8s.io/v1beta2
+          kind: KubeSchedulerConfiguration
+          clientConnection:
+            kubeconfig: "/var/lib/kubernetes/kube-scheduler.kubeconfig"
+          leaderElection:
+            leaderElect: true
+
+    - name: create scheduler.service
+      become: yes
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/kube-scheduler.service
+        content: |
+          [Unit]
+          Description=Kubernetes Scheduler
+          Documentation=https://github.com/kubernetes/kubernetes
+
+          [Service]
+          ExecStart=/usr/local/bin/kube-scheduler \
+            --config=/etc/kubernetes/config/kube-scheduler.yaml \
+            --v=2
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: start controller
+      become: yes
+      shell: |
+        systemctl daemon-reload
+        systemctl enable kube-apiserver kube-controller-manager kube-scheduler
+        systemctl start kube-apiserver kube-controller-manager kube-scheduler
+
+    - name: RBAC for kubelet approval
+      ansible.builtin.copy:
+        dest: ./rbac-kubelet.json
+        content: |
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            annotations:
+              rbac.authorization.kubernetes.io/autoupdate: "true"
+            labels:
+              kubernetes.io/bootstrapping: rbac-defaults
+            name: system:kube-apiserver-to-kubelet
+          rules:
+            - apiGroups:
+                - ""
+              resources:
+                - nodes/proxy
+                - nodes/stats
+                - nodes/log
+                - nodes/spec
+                - nodes/metrics
+              verbs:
+                - "*"
+
+    - name: RBAC for kubelet approval
+      ansible.builtin.shell: kubectl apply --kubeconfig admin.kubeconfig -f rbac-kubelet.json
+
+    - name: RBAC for kubelet approval
+      ansible.builtin.copy:
+        dest: ./rbac-kubelet2.json
+        content: |
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: system:kube-apiserver
+            namespace: ""
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: system:kube-apiserver-to-kubelet
+          subjects:
+            - apiGroup: rbac.authorization.k8s.io
+              kind: User
+              name: kubernetes
+
+    - name: RBAC for kubelet approval
+      ansible.builtin.shell: kubectl apply --kubeconfig admin.kubeconfig -f rbac-kubelet2.json

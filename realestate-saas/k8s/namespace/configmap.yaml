@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: realestate-config
+  namespace: realestate-saas
+data:
+  # フロントエンド設定
+  NEXT_PUBLIC_API_URL: "http://backend-service:8000"
+  NEXT_PUBLIC_APP_NAME: "PropWriter AI"
+  NEXT_PUBLIC_SUPABASE_URL: "https://ktxcfrpajgdhfknoqgzk.supabase.co"  # 要変更
+
+  # バックエンド設定
+  APP_ENV: "production"
+  LOG_LEVEL: "info"
+  ANTHROPIC_MODEL: "claude-opus-4-6"
+  MAX_TOKENS: "2048"
+  CORS_ORIGINS: "http://frontend-service,https://your-domain.com"  # 要変更
+
+  # プラン別トークン上限 (月次)
+  PLAN_STARTER_TOKENS: "50000"
+  PLAN_PRO_TOKENS: "200000"
+  PLAN_ENTERPRISE_TOKENS: "1000000"

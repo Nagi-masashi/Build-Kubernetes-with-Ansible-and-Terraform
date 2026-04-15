@@ -1,0 +1,15 @@
+# terraform.tfvars.example → terraform.tfvars にコピーして値を設定
+# terraform.tfvars は .gitignore に追加すること！
+
+ecr_registry              = "468923492325.dkr.ecr.ap-northeast-1.amazonaws.com"
+supabase_url              = "https://ktxcfrpajgdhfknoqgzk.supabase.co"
+
+# 以下はシークレット（要入力）
+anthropic_api_key         = "sk-ant-..."
+supabase_service_role_key = "eyJhbGci..."
+stripe_secret_key         = "sk_test_dummy"
+stripe_webhook_secret     = "whsec_dummy"
+jwt_secret                = "your-random-32-char-string-here"
+nextauth_secret           = "your-random-32-char-string-here"
+supabase_anon_key         = "eyJhbGci..."  # Supabase Project Settings > API > anon public key
+supabase_jwt_secret       = "your-supabase-jwt-secret"  # Supabase Project Settings > API > JWT Settings > JWT Secret

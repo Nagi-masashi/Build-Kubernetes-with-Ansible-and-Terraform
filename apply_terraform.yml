@@ -1,0 +1,839 @@
+---
+- name: apply teraform
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: apply teraform
+      community.general.terraform:
+        project_path: "./"
+        state: present
+        force_init: true
+      register: terraform_out
+
+    - name: インスタンス名を全Playで使える変数に保存
+      set_fact:
+        global_worker_names: "{{ terraform_out.outputs.worker_names.value }}"
+
+    - name: WokerNodeのプライベートIPを全Playで使える変数に保存
+      set_fact:
+        global_worker_private_ips: "{{ terraform_out.outputs.worker_ip.value }}"
+
+    - name: bastion名を全Playで使える変数に保存
+      set_fact:
+        global_bastion_name: "{{ terraform_out.outputs.bastion_name.value }}"
+
+    - name: 作成されたBastionのパブリックIPを保存
+      set_fact:
+        global_bastion_ip: "{{ terraform_out.outputs.bastion_ip.value }}"
+
+    - name: 作成されたBastionのプライベートIPを表示
+      set_fact:
+        global_bastion_private_ip: "{{ terraform_out.outputs.bastion_private_ip.value }}"
+
+    - name: 作成されたIPをAnsibleのターゲット（メモリ内）に追加
+      add_host:
+        name: "{{ terraform_out.outputs.bastion_ip.value }}"
+        group: bastion_group  # 好きな名前のグループを作る
+        ansible_user: ec2-user
+        # ここで使用するSSHキーを指定（Terraformで設定したもの）
+        ansible_ssh_private_key_file: "./ssh-key/teraform-key.pem"
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+    - name: 作成したワーカーノードをAnsibleの管理対象に追加
+      add_host:
+        name: "{{ item.0 }}"      
+        ansible_host: "{{ item.1 }}"
+        groups: worker_nodes
+        ansible_user: ec2-user
+        # ここで名前も紐付けておくと後で便利
+      loop: "{{ hostvars['localhost']['global_worker_names'] | zip(hostvars['localhost']['global_worker_private_ips']) | list }}"
+
+- name: Bastionにファイルを展開する
+  hosts: bastion_group  # 上で決めたグループ名を指定
+  gather_facts: false
+  become: yes           # sudo権限が必要な場合
+  vars:
+    etcd_version: "v3.4.15"
+
+  tasks:
+    - name: SSHが繋がるようになるまで待機 (最大300秒)
+      wait_for_connection:
+        delay: 10
+        timeout: 300
+
+    - name: csrファイルをコピー
+      copy:
+        src: ./csr-json/
+        dest: /home/ec2-user/
+        mode: '0644'
+
+    - name: デプロイファイルをコピー
+      copy:
+        src: ./templates/
+        dest: /home/ec2-user/templates/
+        mode: '0644'
+
+    - name: sshキーをコピー
+      copy:
+        src: ./ssh-key/teraform-key.pem
+        dest: /home/ec2-user/teraform-key.pem
+        mode: '0600'
+        owner: ec2-user
+        group: ec2-user
+
+    - name: 必要なツール(wget)をインストール
+      dnf:
+        name: wget
+        state: present
+
+    - name: K8s関連バイナリをダウンロード
+      get_url:
+        url: "{{ item.url }}"
+        dest: "/usr/local/bin/{{ item.name }}"
+        mode: '0755'
+        owner: root
+        group: root
+        # タイムアウトを少し長めに設定 (デフォルトは10秒)
+        timeout: 30
+      loop:
+        - { name: 'cfssl', url: 'https://pkg.cfssl.org/R1.2/cfssl_linux-amd64' }
+        - { name: 'cfssljson', url: 'https://pkg.cfssl.org/R1.2/cfssljson_linux-amd64' }
+        - { name: 'kubectl', url: 'https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl' }
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: すべてのワーカー用CSRをBastionに集約
+      copy:
+        src: "csr-json/{{ item }}-csr.json"
+        dest: "/home/ec2-user/{{ item }}-csr.json"
+      loop: "{{ hostvars['localhost']['global_worker_names'] }}"
+
+    - name: CA認証局を発行
+      shell: |
+        cfssl gencert -initca ca-csr.json | cfssljson -bare ca
+      args:
+        chdir: /home/ec2-user
+        creates: /home/ec2-user/ca.pem
+
+    - name: adminの証明書を発行
+      shell: |
+        cfssl gencert \
+          -ca=ca.pem \
+          -ca-key=ca-key.pem \
+          -config=ca-config.json \
+          -profile=kubernetes \
+          admin-csr.json | cfssljson -bare admin
+      args:
+        chdir: /home/ec2-user
+        creates: /home/ec2-user/admin.pem
+
+    - name: クライアント証明書を発行
+      shell: |
+        cfssl gencert \
+          -ca=ca.pem \
+          -ca-key=ca-key.pem \
+          -config=ca-config.json \
+          -hostname={{ item.0 }},{{ item.1 }} -profile=kubernetes {{ item.0 }}-csr.json | cfssljson -bare {{ item.0 }}
+      args:
+        chdir: /home/ec2-user
+        creates: /home/ec2-user/kube-controller-manager.pem
+      loop: "{{ hostvars['localhost']['global_worker_names'] | zip(hostvars['localhost']['global_worker_private_ips']) | list }}"
+
+    - name: Kube-Controller-Managerの証明書を発行
+      shell: |
+        cfssl gencert \
+          -ca=ca.pem \
+          -ca-key=ca-key.pem \
+          -config=ca-config.json \
+          -profile=kubernetes \
+          kube-controller-manager-csr.json | cfssljson -bare kube-controller-manager
+      args:
+        chdir: /home/ec2-user
+        creates: /home/ec2-user/kube-controller-manager.pem
+
+    - name: kube-proxyの証明書を発行
+      shell: |
+        cfssl gencert \
+          -ca=ca.pem \
+          -ca-key=ca-key.pem \
+          -config=ca-config.json \
+          -profile=kubernetes \
+          kube-proxy-csr.json | cfssljson -bare kube-proxy
+      args:
+        chdir: /home/ec2-user
+        creates: /home/ec2-user/kube-proxy.pem
+
+    - name: kube-schedulerの証明書を発行
+      shell: |
+        cfssl gencert \
+          -ca=ca.pem \
+          -ca-key=ca-key.pem \
+          -config=ca-config.json \
+          -profile=kubernetes \
+          kube-scheduler-csr.json | cfssljson -bare kube-scheduler
+      args:
+        chdir: /home/ec2-user
+        creates: /home/ec2-user/kube-scheduler.pem
+
+    - name: サーバ証明書を発行
+      shell: |
+        cfssl gencert \
+          -ca=ca.pem \
+          -ca-key=ca-key.pem \
+          -config=ca-config.json \
+          -hostname=10.32.0.1,{{ hostvars['localhost']['global_bastion_private_ip'] }},{{ hostvars['localhost']['global_bastion_ip'] }},127.0.0.1,kubernetes,kubernetes.default,kubernetes.default.svc,kubernetes.default.svc.cluster,kubernetes.svc.cluster.local \
+          -profile=kubernetes kubernetes-csr.json | cfssljson -bare kubernetes
+      args:
+        chdir: /home/ec2-user
+        creates: /home/ec2-user/kubernetes.pem
+
+    - name: Service Account の証明書を発行
+      shell: |
+        cfssl gencert \
+          -ca=ca.pem \
+          -ca-key=ca-key.pem \
+          -config=ca-config.json \
+          -profile=kubernetes \
+          service-account-csr.json | cfssljson -bare service-account
+      args:
+        chdir: /home/ec2-user
+        creates: /home/ec2-user/service-account.pem
+
+    - name: kubeletのconfigファイル作成
+      shell: |
+        kubectl config set-cluster kubernetes-the-hard-way \
+          --certificate-authority=ca.pem \
+          --embed-certs=true \
+          --server=https://{{ hostvars['localhost']['global_bastion_private_ip'] }}:6443 --kubeconfig={{ item }}.kubeconfig
+      args:
+        chdir: /home/ec2-user
+        creates: /home/ec2-user/{{ item }}.kubeconfig
+      loop: "{{ hostvars['localhost']['global_worker_names'] }}"
+
+    - name: kubeletのcredentialsのセッティング
+      shell: |
+        kubectl config set-credentials system:node:{{ item }}\
+          --client-certificate={{ item }}.pem \
+          --client-key={{ item }}-key.pem \
+          --embed-certs=true --kubeconfig={{ item }}.kubeconfig
+      args:
+        chdir: /home/ec2-user
+      loop: "{{ hostvars['localhost']['global_worker_names'] }}"
+
+    - name: kubeletのcontextのセッティング
+      shell: |
+        kubectl config set-context default \
+          --cluster=kubernetes-the-hard-way \
+          --user=system:node:{{ item }} --kubeconfig={{ item }}.kubeconfig
+      args:
+        chdir: /home/ec2-user
+      loop: "{{ hostvars['localhost']['global_worker_names'] }}"
+
+    - name: kubeletのcontextのデフォルト設定
+      shell: |
+        kubectl config use-context default --kubeconfig={{ item }}.kubeconfig
+      args:
+        chdir: /home/ec2-user
+      loop: "{{ hostvars['localhost']['global_worker_names'] }}"
+
+    - name: kube-proxyのconfigファイル作成
+      shell: |
+        kubectl config set-cluster kubernetes-the-hard-way \
+          --certificate-authority=ca.pem \
+          --embed-certs=true \
+          --server=https://{{ hostvars['localhost']['global_bastion_private_ip'] }}:6443 --kubeconfig=kube-proxy.kubeconfig
+      args:
+        chdir: /home/ec2-user
+
+    - name: kube-proxyのcredentialsのセッティング
+      shell: |
+        kubectl config set-credentials system:kube-proxy \
+          --client-certificate=kube-proxy.pem \
+          --client-key=kube-proxy-key.pem \
+          --embed-certs=true \
+          --kubeconfig=kube-proxy.kubeconfig
+      args:
+        chdir: /home/ec2-user
+
+    - name: kube-proxyのcontextのセッティング
+      shell: |
+        kubectl config set-context default \
+          --cluster=kubernetes-the-hard-way \
+          --user=system:kube-proxy \
+          --kubeconfig=kube-proxy.kubeconfig
+      args:
+        chdir: /home/ec2-user
+
+    - name: kube-proxyのcontextのデフォルト設定
+      shell: |
+        kubectl config use-context default --kubeconfig=kube-proxy.kubeconfig
+      args:
+        chdir: /home/ec2-user
+
+    - name: kube-controller-managerのconfigファイル作成
+      shell: |
+        kubectl config set-cluster kubernetes-the-hard-way \
+          --certificate-authority=ca.pem \
+          --embed-certs=true \
+          --server=https://127.0.0.1:6443 \
+          --kubeconfig=kube-controller-manager.kubeconfig
+      args:
+        chdir: /home/ec2-user
+
+    - name: kube-controller-managerのcredentialsのセッティング
+      shell: |
+        kubectl config set-credentials system:kube-controller-manager \
+          --client-certificate=kube-controller-manager.pem \
+          --client-key=kube-controller-manager-key.pem \
+          --embed-certs=true \
+          --kubeconfig=kube-controller-manager.kubeconfig
+      args:
+        chdir: /home/ec2-user
+
+    - name: kube-controller-managerのcontextのセッティング
+      shell: |
+        kubectl config set-context default \
+          --cluster=kubernetes-the-hard-way \
+          --user=system:kube-controller-manager \
+          --kubeconfig=kube-controller-manager.kubeconfig
+      args:
+        chdir: /home/ec2-user
+
+    - name: kube-controller-managerのcontextのデフォルト設定
+      shell: |
+        kubectl config use-context default --kubeconfig=kube-controller-manager.kubeconfig
+      args:
+        chdir: /home/ec2-user
+
+    - name: kube-schedulerのconfigファイル作成
+      shell: |
+        kubectl config set-cluster kubernetes-the-hard-way \
+          --certificate-authority=ca.pem \
+          --embed-certs=true \
+          --server=https://127.0.0.1:6443 \
+          --kubeconfig=kube-scheduler.kubeconfig
+      args:
+        chdir: /home/ec2-user
+
+    - name: kube-schedulerのcredentialsのセッティング
+      shell: |
+        kubectl config set-credentials system:kube-scheduler \
+          --client-certificate=kube-scheduler.pem \
+          --client-key=kube-scheduler-key.pem \
+          --embed-certs=true \
+          --kubeconfig=kube-scheduler.kubeconfig
+      args:
+        chdir: /home/ec2-user
+
+    - name: kube-schedulerのcontextのセッティング
+      shell: |
+        kubectl config set-context default \
+          --cluster=kubernetes-the-hard-way \
+          --user=system:kube-scheduler \
+          --kubeconfig=kube-scheduler.kubeconfig
+      args:
+        chdir: /home/ec2-user
+
+    - name: kube-schedulerのcontextのデフォルト設定
+      shell: |
+        kubectl config use-context default --kubeconfig=kube-scheduler.kubeconfig
+      args:
+        chdir: /home/ec2-user
+
+    - name: admin Kubernetesのconfigファイル作成
+      shell: |
+        kubectl config set-cluster kubernetes-the-hard-way \
+          --certificate-authority=ca.pem \
+          --embed-certs=true \
+          --server=https://127.0.0.1:6443 \
+          --kubeconfig=admin.kubeconfig
+      args:
+        chdir: /home/ec2-user
+
+    - name: admin Kubernetesのcredentialsのセッティング
+      shell: |
+        kubectl config set-credentials admin \
+          --client-certificate=admin.pem \
+          --client-key=admin-key.pem \
+          --embed-certs=true \
+          --kubeconfig=admin.kubeconfig
+      args:
+        chdir: /home/ec2-user
+
+    - name: admin Kubernetesのcontextのセッティング
+      shell: |
+        kubectl config set-context default \
+          --cluster=kubernetes-the-hard-way \
+          --user=admin \
+          --kubeconfig=admin.kubeconfig
+      args:
+        chdir: /home/ec2-user
+
+    - name: admin Kubernetesのcontextのデフォルト設定
+      shell: |
+        kubectl config use-context default --kubeconfig=admin.kubeconfig
+      args:
+        chdir: /home/ec2-user
+
+    - name: 暗号化キーの生成
+      # Mac(localhost)で実行して結果を変数に保存
+      shell: "head -c 32 /dev/urandom | base64"
+      delegate_to: localhost
+      become: no
+      register: generated_key
+
+    - name: テンプレートから encryption-config.yaml を生成して転送
+      template:
+        src: templates/encryption-config.yaml.j2  # ローカルのファイル
+        dest: /home/ec2-user/encryption-config.yaml # リモートの保存先
+      vars:
+        encryption_key: "{{ generated_key.stdout }}"
+
+    - name: テンプレートから etcd.service を生成して転送
+      template:
+        src: templates/etcd.service.j2  # ローカルのファイル
+        dest: /etc/systemd/system/etcd.service # リモートの保存先
+      vars:
+        bastion_private_ip: "{{ hostvars['localhost']['global_bastion_private_ip'] }}"
+        bastion_name: "{{ hostvars['localhost']['global_bastion_name'] }}"
+
+    - name: 証明書とkubeconfigを各ワーカーノードに配布
+      shell: |
+        # scpでファイルを転送（StrictHostKeyChecking=no で警告を無視）
+        scp -i /home/ec2-user/teraform-key.pem \
+          -o StrictHostKeyChecking=no \
+          ca.pem \
+          {{ item.0 }}-key.pem \
+          {{ item.0 }}.pem \
+          {{ item.0 }}.kubeconfig \
+          kube-proxy.kubeconfig \
+          encryption-config.yaml \
+          ec2-user@{{ item.1 }}:~/
+      args:
+        chdir: /home/ec2-user
+      # 名前(item.0) と プライベートIP(item.1) のペアで回す
+      loop: "{{ hostvars['localhost']['global_worker_names'] | zip(hostvars['localhost']['global_worker_private_ips']) | list }}"
+
+    - name: admin.kubeconfig の所有権と権限を設定
+      file:
+        path: /home/ec2-user/admin.kubeconfig
+        owner: ec2-user
+        group: ec2-user
+        mode: '0600'
+
+    - name: etcd バイナリをダウンロード
+      get_url:
+        url: "https://github.com/etcd-io/etcd/releases/download/{{ etcd_version }}/etcd-{{ etcd_version }}-linux-amd64.tar.gz"
+        dest: /tmp/etcd.tar.gz
+        mode: '0644'
+
+    - name: etcd を解凍してバイナリを移動
+      shell: |
+        tar -xvf /tmp/etcd.tar.gz -C /tmp/
+        mv /tmp/etcd-{{ etcd_version }}-linux-amd64/etcd* /usr/local/bin/
+      args:
+        creates: /usr/local/bin/etcd # すでに存在すればスキップ
+
+    - name: etcd 用のディレクトリを作成
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0700'
+        owner: root
+        group: root
+      loop:
+        - /etc/etcd
+        - /var/lib/etcd
+
+    - name: 証明書ファイルを /etc/etcd/ に配置
+      # 既にBastionから転送済みのファイルを想定（pathは調整してください）
+      copy:
+        src: "/home/ec2-user/{{ item }}"
+        dest: "/etc/etcd/{{ item }}"
+        remote_src: yes # サーバー内での移動
+        mode: '0644'
+      loop:
+        - ca.pem
+        - kubernetes-key.pem
+        - kubernetes.pem
+
+    - name: etcd サービスを有効化して起動
+      systemd:
+        name: etcd
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+    - name: etcd クラスターの状態を確認
+      shell: |
+        ETCDCTL_API=3 etcdctl member list \
+          --endpoints=https://127.0.0.1:2379 \
+          --cacert=/etc/etcd/ca.pem \
+          --cert=/etc/etcd/kubernetes.pem \
+          --key=/etc/etcd/kubernetes-key.pem
+      register: etcd_status
+
+    - name: etcd の状態を表示
+      debug:
+        var: etcd_status.stdout_lines
+
+    - name: Kubernetes Control Plane バイナリのダウンロード
+      get_url:
+        url: "https://storage.googleapis.com/kubernetes-release/release/v1.31.0/bin/linux/amd64/{{ item }}"
+        dest: "/usr/local/bin/{{ item }}"
+        mode: '0755'
+      loop:
+        - kube-apiserver
+        - kube-controller-manager
+        - kube-scheduler
+        - kubectl
+
+    - name: kube-controller 用のディレクトリを作成
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0700'
+        owner: root
+        group: root
+      loop:
+        - /var/lib/kubernetes/
+        - /etc/kubernetes/config
+
+    - name: 証明書ファイルを /var/lib/kubernetes に配置
+      copy:
+        src: "/home/ec2-user/{{ item }}"
+        dest: "/var/lib/kubernetes/{{ item }}"
+        remote_src: yes # サーバー内での移動
+        mode: '0644'
+      loop:
+        - ca.pem
+        - ca-key.pem
+        - kubernetes-key.pem
+        - kubernetes.pem
+        - service-account-key.pem
+        - service-account.pem
+        - kube-controller-manager.kubeconfig
+        - kube-scheduler.kubeconfig
+        - encryption-config.yaml 
+
+    - name: テンプレートから kube-apiserver.service を生成して転送
+      template:
+        src: templates/kube-apiserver.service.j2  # ローカルのファイル
+        dest: /etc/systemd/system/kube-apiserver.service # リモートの保存先
+      vars:
+        bastion_private_ip: "{{ hostvars['localhost']['global_bastion_private_ip'] }}"
+
+    - name: テンプレートから kube-controller-manager.service を生成して転送
+      template:
+        src: templates/kube-controller-manager.service.j2  # ローカルのファイル
+        dest: /etc/systemd/system/kube-controller-manager.service # リモートの保存先
+
+    - name: テンプレートから kube-scheduler.yaml を生成して転送
+      template:
+        src: templates/kube-scheduler.yaml.j2  # ローカルのファイル
+        dest: /etc/kubernetes/config/kube-scheduler.yaml # リモートの保存先
+
+    - name: テンプレートから kube-scheduler.service を生成して転送
+      template:
+        src: templates/kube-scheduler.service.j2  # ローカルのファイル
+        dest: /etc/systemd/system/kube-scheduler.service # リモートの保存先
+
+    - name: kube-controller サービスを有効化して起動
+      systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      loop:
+        - kube-apiserver
+        - kube-controller-manager
+        - kube-scheduler
+
+    - name: クラスターコンポーネントの状態を確認 (Health Check)
+      shell: |
+        kubectl get componentstatuses \
+          --kubeconfig /home/ec2-user/admin.kubeconfig
+      register: kube_health
+
+    - name: 健康診断結果を表示
+      debug:
+        var: kube_health.stdout_lines
+
+    - name: ClusterRole設定
+      shell: |
+        kubectl apply --kubeconfig admin.kubeconfig -f templates/clusterrole.yaml
+      args:
+        chdir: /home/ec2-user
+
+    - name: ClusterRoleBinding設定
+      shell: |
+        kubectl apply --kubeconfig admin.kubeconfig -f templates/clusterrolebinding.yaml
+      args:
+        chdir: /home/ec2-user
+
+- name: ワーカーノードでのコマンド実行
+  hosts: worker_nodes
+  become: yes  # 必要に応じてsudo権限
+  vars:
+    # Bastionを中継地点として指定する（ProxyJump）
+    ansible_ssh_common_args: >
+      -o ProxyCommand="ssh -i ./ssh-key/teraform-key.pem -W %h:%p -q ec2-user@{{ hostvars['localhost']['global_bastion_ip'] }} -o StrictHostKeyChecking=no"
+      -o StrictHostKeyChecking=no
+      -o UserKnownHostsFile=/dev/null
+  tasks:
+    - name: ワーカーノードでホスト名を確認
+      command: hostname
+      register: worker_hostname
+
+    - name: 結果を表示
+      debug:
+        msg: "このワーカーの名前は {{ worker_hostname.stdout }} です"
+
+    - name: Mac にある証明書と kubeconfig を各 WorkerNode へ配布
+      copy:
+        # src は Mac 上のパス（相対パス or 絶対パス）
+        src: "./templates/"
+        # dest は WorkerNode 上の保存先
+        dest: "/home/ec2-user/"
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: 依存パッケージのインストール (AL2023)
+      dnf:
+        name:
+          - socat
+          - conntrack
+          - ipset
+        state: present
+
+    - name: スワップの無効化
+      shell: |
+        swapon --show
+        swapoff -a
+      register: swap_status
+      changed_when: "swap_status.stdout != ''"
+    
+    - name: Worker用ディレクトリの作成
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /etc/cni/net.d
+        - /opt/cni/bin
+        - /var/lib/kubelet
+        - /var/lib/kube-proxy
+        - /var/lib/kubernetes
+        - /var/run/kubernetes
+        - /etc/containerd/
+
+    - name: 必要なツール(wget)をインストール
+      dnf:
+        name: wget
+        state: present
+
+    - name: Workerバイナリのダウンロードと展開
+      shell: |
+        # 1. CRIツール
+        wget -q --https-only https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.31.0/crictl-v1.31.0-linux-amd64.tar.gz
+        tar -xvf crictl-v1.31.0-linux-amd64.tar.gz -C /usr/local/bin/
+
+        # 2. CNIプラグイン
+        wget -q --https-only https://github.com/containernetworking/plugins/releases/download/v1.5.1/cni-plugins-linux-amd64-v1.5.1.tgz
+        tar -xvf cni-plugins-linux-amd64-v1.5.1.tgz -C /opt/cni/bin/
+
+        # 3. runc (AL2023はパッケージ版が安定しているためdnf推奨ですが、バイナリなら以下)
+        wget -q --https-only https://github.com/opencontainers/runc/releases/download/v1.1.14/runc.amd64
+        chmod +x runc.amd64
+        mv runc.amd64 /usr/local/bin/runc
+
+        # 4. containerd (v1.7.x系を推奨)
+        wget -q --https-only https://github.com/containerd/containerd/releases/download/v1.7.21/containerd-1.7.21-linux-amd64.tar.gz
+        tar -xvf containerd-1.7.21-linux-amd64.tar.gz -C /usr/local/
+        
+        # 5. K8s Worker バイナリ (v1.31.0)
+        wget -q --https-only https://storage.googleapis.com/kubernetes-release/release/v1.31.0/bin/linux/amd64/kubectl
+        wget -q --https-only https://storage.googleapis.com/kubernetes-release/release/v1.31.0/bin/linux/amd64/kube-proxy
+        wget -q --https-only https://storage.googleapis.com/kubernetes-release/release/v1.31.0/bin/linux/amd64/kubelet
+        
+        chmod +x kubectl kube-proxy kubelet
+        mv kubectl kube-proxy kubelet /usr/local/bin/
+
+      args:
+        chdir: /tmp
+        creates: /usr/local/bin/kubelet
+
+    - name: confファイルの配置
+      shell: |
+        mv 10-bridge.conf /etc/cni/net.d/10-bridge.conf
+        mv 99-loopback.conf /etc/cni/net.d/99-loopback.conf
+        mv config.toml /etc/containerd/config.toml
+        mv containerd.service /etc/systemd/system/containerd.service
+        mv crictl.yaml /etc/crictl.yaml
+        mv kube-proxy.kubeconfig /var/lib/kube-proxy/kubeconfig
+        mv kube-proxy-config.yaml /var/lib/kube-proxy/kube-proxy-config.yaml
+        mv kube-proxy.service /etc/systemd/system/kube-proxy.service
+        mv 99-kubernetes-cri.conf /etc/sysctl.d/99-kubernetes-cri.conf
+      args:
+        chdir: /home/ec2-user
+
+    - name: Macから各ノード固有の鍵を転送
+      copy:
+        src: "/home/ec2-user/{{ inventory_hostname }}-key.pem"
+        dest: "/var/lib/kubelet/"
+        remote_src: yes # サーバー内での移動
+        mode: '0644'
+
+    - name: Macから各ノード固有の証明書を転送
+      copy:
+        src: "/home/ec2-user/{{ inventory_hostname }}.pem"
+        dest: "/var/lib/kubelet/"
+        remote_src: yes # サーバー内での移動
+        mode: '0644'
+
+    - name: 各ノードの kubeconfig を転送
+      copy:
+        src: "./{{ inventory_hostname }}.kubeconfig"
+        dest: "/var/lib/kubelet/kubeconfig"
+        remote_src: yes
+        mode: '0644'
+
+    - name: テンプレートから kubelet.service を生成して転送
+      template:
+        src: templates/kubelet.service.j2  # ローカルのファイル
+        dest: /etc/systemd/system/kubelet.service # リモートの保存先
+      vars:
+        worker_name: "{{ inventory_hostname }}"
+
+    - name: 共通の CA 証明書を転送
+      copy:
+        src: "./ca.pem"
+        dest: "/var/lib/kubernetes/ca.pem"
+        remote_src: yes
+        mode: '0644'
+
+    - name: テンプレートから kubelet-config.yaml.yaml を生成して転送
+      template:
+        src: templates/kubelet-config.yaml.j2  # ローカルのファイル
+        dest: /var/lib/kubelet/kubelet-config.yaml # リモートの保存先
+      vars:
+        worker_name: "{{ inventory_hostname }}"
+
+    - name: Worker バイナリの解凍と配置
+      shell: |
+        # 作業ディレクトリを作成
+        mkdir -p /tmp/worker_setup/containerd
+        cd /tmp/worker_setup
+
+        # 1. crictl の展開
+        tar -xvf /tmp/crictl-v1.31.0-linux-amd64.tar.gz -C /usr/local/bin/
+
+        # 2. containerd の展開 (binディレクトリの中身を直接 /usr/local/bin へ)
+        tar -xvf /tmp/containerd-1.7.21-linux-amd64.tar.gz -C containerd
+        mv containerd/bin/* /usr/local/bin/
+
+        # 3. CNI プラグインの展開
+        tar -xvf /tmp/cni-plugins-linux-amd64-v1.5.1.tgz -C /opt/cni/bin/
+
+        # 4. runc のリネームと権限付与
+        mv /tmp/runc.amd64 /usr/local/bin/runc
+        chmod +x /usr/local/bin/runc
+
+        # 5. K8s バイナリの権限付与と移動
+        chmod +x /tmp/kubectl /tmp/kube-proxy /tmp/kubelet
+        mv /tmp/kubectl /tmp/kube-proxy /tmp/kubelet /usr/local/bin/
+
+      args:
+        # 既に配置済みなら実行しない（冪等性）
+        creates: /usr/local/bin/kubelet
+      become: yes
+
+    - name: kube-controller サービスを有効化して起動
+      systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+        daemon_reload: yes
+      loop:
+        - containerd
+        - kubelet
+        - kube-proxy
+
+    - name: IPv4 パケットフォワーディングを有効化 (即時反映)
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        sysctl_set: yes
+        state: present
+        reload: yes
+
+- name: Bastionにファイルを展開する
+  hosts: bastion_group  # 上で決めたグループ名を指定
+  gather_facts: false
+  become: yes           # sudo権限が必要な場合
+  tasks:
+    - name: ノードが Ready になるまで少し待機 (30秒)
+      pause:
+        seconds: 30
+
+    - name: リモート接続設定
+      shell: |
+        sudo chown ec2-user:ec2-user ca.pem admin.pem admin-key.pem
+      args:
+        chdir: /home/ec2-user
+
+    - name: リモート接続設定
+      shell: |
+        kubectl config set-cluster kubernetes-the-hard-way \
+          --certificate-authority=ca.pem \
+          --embed-certs=true \
+          --server=https://{{ hostvars['localhost']['global_bastion_private_ip'] }}:6443
+      args:
+        chdir: /home/ec2-user
+
+    - name: リモート接続クレデンシャル設定
+      shell: |
+        kubectl config set-credentials admin \
+          --client-certificate=admin.pem \
+          --client-key=admin-key.pem
+      args:
+        chdir: /home/ec2-user
+
+    - name: リモート接続設定のcontextのセッティング
+      shell: |
+        kubectl config set-context kubernetes-the-hard-way \
+          --cluster=kubernetes-the-hard-way \
+          --user=admin
+      args:
+        chdir: /home/ec2-user
+
+    - name: リモート接続設定のデフォルト設定
+      shell: |
+        kubectl config use-context kubernetes-the-hard-way
+      args:
+        chdir: /home/ec2-user
+
+    - name: flannel適用
+      shell: |
+        curl -sL https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml | \
+        sed 's|10.244.0.0/16|172.100.0.0/16|g' | \
+        KUBECONFIG=/home/ec2-user/admin.kubeconfig kubectl apply -f -
+      args:
+        chdir: /home/ec2-user
+
+    - name: ノードが Ready になるまで待機 (最大200秒)
+      shell: kubectl get nodes
+      register: node_status
+      until: 
+        - "'NotReady' not in node_status.stdout"
+        - "'Ready' in node_status.stdout"
+      retries: 20
+      delay: 10
+      changed_when: false
+
+    - name: 最終的なノードの状態を表示
+      debug:
+        var: node_status.stdout_lines

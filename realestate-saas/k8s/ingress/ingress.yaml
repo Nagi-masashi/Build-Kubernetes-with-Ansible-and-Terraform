@@ -1,0 +1,49 @@
+# 前提: nginx ingress controller がインストール済みであること
+# kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.10.0/deploy/static/provider/aws/deploy.yaml
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: realestate-ingress
+  namespace: realestate-saas
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"  # Claude API レスポンス待機
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    # SSL (cert-manager 導入後にコメントアウト解除)
+    # cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    # nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  # tls:
+  #   - hosts:
+  #       - your-domain.com
+  #     secretName: realestate-tls
+  rules:
+    - host: your-domain.com  # 要変更 (または IP直接アクセス時は削除)
+      http:
+        paths:
+          # API エンドポイント → バックエンドへ
+          - path: /api/v1
+            pathType: Prefix
+            backend:
+              service:
+                name: backend-service
+                port:
+                  number: 8000
+          # Webhook (Stripe) → バックエンドへ
+          - path: /webhooks
+            pathType: Prefix
+            backend:
+              service:
+                name: backend-service
+                port:
+                  number: 8000
+          # それ以外 → フロントエンドへ
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend-service
+                port:
+                  number: 3000

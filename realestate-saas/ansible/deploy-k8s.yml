@@ -1,0 +1,263 @@
+---
+# PropWriter AI - K8s デプロイ用 Ansible Playbook
+# 使用方法: ansible-playbook ansible/deploy-k8s.yml -i inventory/hosts.yml
+#
+# 前提条件:
+#   - apply_terraform.yml でK8sクラスターが構築済み
+#   - ECR にイメージがプッシュ済み
+#   - AWS CLI がローカルで設定済み
+
+- name: PropWriter AI を Kubernetes にデプロイ
+  hosts: bastion
+  gather_facts: false
+  vars:
+    k8s_namespace: realestate-saas
+    local_manifest_dir: "{{ playbook_dir }}/../k8s"
+    remote_manifest_dir: /home/ec2-user/realestate-saas/k8s
+    kubeconfig: /home/ec2-user/admin.kubeconfig
+    ecr_registry: "{{ ecr_account_id }}.dkr.ecr.ap-northeast-1.amazonaws.com"
+    image_tag: "{{ lookup('env', 'IMAGE_TAG') | default('latest', true) }}"
+
+  tasks:
+    # ────────────────────────────────
+    # 1. マニフェストを Bastion に転送
+    # ────────────────────────────────
+    - name: マニフェスト用ディレクトリを作成
+      ansible.builtin.file:
+        path: "{{ remote_manifest_dir }}"
+        state: directory
+        mode: '0755'
+        owner: ec2-user
+        group: ec2-user
+      become: yes
+
+    - name: K8s マニフェストを Bastion に転送
+      ansible.builtin.copy:
+        src: "{{ local_manifest_dir }}/"
+        dest: "{{ remote_manifest_dir }}/"
+        owner: ec2-user
+        group: ec2-user
+        mode: '0644'
+      become: yes
+
+    # ────────────────────────────────
+    # 2. Namespace を先に作成
+    # ────────────────────────────────
+    - name: Namespace を適用
+      ansible.builtin.command:
+        cmd: kubectl apply -f {{ remote_manifest_dir }}/namespace/namespace.yaml --validate=false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        HOME: /home/ec2-user
+      register: ns_result
+      changed_when: "'created' in ns_result.stdout or 'configured' in ns_result.stdout"
+
+    - name: ConfigMap を適用
+      ansible.builtin.command:
+        cmd: kubectl apply -f {{ remote_manifest_dir }}/namespace/configmap.yaml --validate=false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        HOME: /home/ec2-user
+      register: cm_result
+      changed_when: "'created' in cm_result.stdout or 'configured' in cm_result.stdout"
+
+    - name: Secret が存在するか確認
+      ansible.builtin.command:
+        cmd: kubectl get secret realestate-secrets -n {{ k8s_namespace }}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        HOME: /home/ec2-user
+      register: secret_check
+      failed_when: false
+      changed_when: false
+
+    - name: Secret を Bastion に転送
+      ansible.builtin.copy:
+        src: "{{ local_manifest_dir }}/namespace/secret.yaml"
+        dest: "{{ remote_manifest_dir }}/namespace/secret.yaml"
+        owner: ec2-user
+        group: ec2-user
+        mode: '0600'
+      become: yes
+      when: secret_check.rc != 0
+
+    - name: Secret を適用 (初回のみ)
+      ansible.builtin.command:
+        cmd: kubectl apply -f {{ remote_manifest_dir }}/namespace/secret.yaml --validate=false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        HOME: /home/ec2-user
+      when: secret_check.rc != 0
+
+    # ────────────────────────────────
+    # 3b. ECR imagePullSecret を作成
+    #     ECRトークンはローカルMacで取得
+    # ────────────────────────────────
+    - name: ECR ログイントークンをローカルで取得
+      ansible.builtin.shell: |
+        aws ecr get-login-password --region ap-northeast-1
+      delegate_to: localhost
+      register: ecr_token
+      changed_when: false
+
+    - name: ECR imagePullSecret を K8s に登録
+      ansible.builtin.shell: |
+        kubectl create secret docker-registry ecr-secret \
+          --docker-server={{ ecr_registry }} \
+          --docker-username=AWS \
+          --docker-password='{{ ecr_token.stdout }}' \
+          --namespace={{ k8s_namespace }} \
+          --dry-run=client -o yaml --validate=false | \
+        kubectl apply -f - --validate=false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        HOME: /home/ec2-user
+      changed_when: false
+
+    # ────────────────────────────────
+    # 4. Ingress Controller (初回のみ)
+    # ────────────────────────────────
+    - name: nginx ingress controller が存在するか確認
+      ansible.builtin.command:
+        cmd: kubectl get namespace ingress-nginx
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        HOME: /home/ec2-user
+      register: ingress_ns_check
+      failed_when: false
+      changed_when: false
+
+    - name: nginx ingress controller をインストール
+      ansible.builtin.command:
+        cmd: >
+          kubectl apply -f
+          https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.10.0/deploy/static/provider/aws/deploy.yaml
+          --validate=false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        HOME: /home/ec2-user
+      when: ingress_ns_check.rc != 0
+
+    - name: nginx ingress controller の Pod が Ready になるまで待機
+      ansible.builtin.command:
+        cmd: kubectl rollout status deployment/ingress-nginx-controller -n ingress-nginx --timeout=180s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        HOME: /home/ec2-user
+      when: ingress_ns_check.rc != 0
+
+    # ────────────────────────────────
+    # 5. バックエンドのデプロイ
+    # ────────────────────────────────
+    - name: バックエンドイメージタグを更新
+      ansible.builtin.replace:
+        path: "{{ remote_manifest_dir }}/backend/deployment.yaml"
+        regexp: 'YOUR_ECR_REPO/realestate-backend:.*'
+        replace: "{{ ecr_registry }}/realestate-backend:{{ image_tag }}"
+
+    - name: バックエンド Deployment を適用
+      ansible.builtin.command:
+        cmd: kubectl apply -f {{ remote_manifest_dir }}/backend/deployment.yaml --validate=false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        HOME: /home/ec2-user
+      register: backend_deploy
+      changed_when: "'created' in backend_deploy.stdout or 'configured' in backend_deploy.stdout"
+
+    - name: バックエンド Service を適用
+      ansible.builtin.command:
+        cmd: kubectl apply -f {{ remote_manifest_dir }}/backend/service.yaml --validate=false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        HOME: /home/ec2-user
+
+    - name: バックエンド HPA を適用
+      ansible.builtin.command:
+        cmd: kubectl apply -f {{ remote_manifest_dir }}/backend/hpa.yaml --validate=false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        HOME: /home/ec2-user
+
+    # ────────────────────────────────
+    # 6. フロントエンドのデプロイ
+    # ────────────────────────────────
+    - name: フロントエンドイメージタグを更新
+      ansible.builtin.replace:
+        path: "{{ remote_manifest_dir }}/frontend/deployment.yaml"
+        regexp: 'YOUR_ECR_REPO/realestate-frontend:.*'
+        replace: "{{ ecr_registry }}/realestate-frontend:{{ image_tag }}"
+
+    - name: フロントエンド Deployment を適用
+      ansible.builtin.command:
+        cmd: kubectl apply -f {{ remote_manifest_dir }}/frontend/deployment.yaml --validate=false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        HOME: /home/ec2-user
+
+    - name: フロントエンド Service を適用
+      ansible.builtin.command:
+        cmd: kubectl apply -f {{ remote_manifest_dir }}/frontend/service.yaml --validate=false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        HOME: /home/ec2-user
+
+    # ────────────────────────────────
+    # 7. Ingress を適用
+    # ────────────────────────────────
+    - name: Ingress を適用
+      ansible.builtin.command:
+        cmd: kubectl apply -f {{ remote_manifest_dir }}/ingress/ingress.yaml --validate=false
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        HOME: /home/ec2-user
+
+    # ────────────────────────────────
+    # 8. ロールアウト確認
+    # ────────────────────────────────
+    - name: バックエンドのロールアウト完了を待機
+      ansible.builtin.command:
+        cmd: kubectl rollout status deployment/backend -n {{ k8s_namespace }} --timeout=120s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        HOME: /home/ec2-user
+      register: backend_status
+      changed_when: false
+
+    - name: フロントエンドのロールアウト完了を待機
+      ansible.builtin.command:
+        cmd: kubectl rollout status deployment/frontend -n {{ k8s_namespace }} --timeout=120s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        HOME: /home/ec2-user
+      register: frontend_status
+      changed_when: false
+
+    # ────────────────────────────────
+    # 9. デプロイ結果サマリー
+    # ────────────────────────────────
+    - name: Pod 状態を確認
+      ansible.builtin.command:
+        cmd: kubectl get pods -n {{ k8s_namespace }} -o wide
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        HOME: /home/ec2-user
+      register: pods_status
+      changed_when: false
+
+    - name: Ingress の外部 IP を確認
+      ansible.builtin.command:
+        cmd: kubectl get ingress -n {{ k8s_namespace }}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+        HOME: /home/ec2-user
+      register: ingress_status
+      changed_when: false
+
+    - name: デプロイ完了サマリー
+      ansible.builtin.debug:
+        msg:
+          - "✅ PropWriter AI デプロイ完了"
+          - "Pod 状態:"
+          - "{{ pods_status.stdout_lines }}"
+          - "Ingress:"
+          - "{{ ingress_status.stdout_lines }}"

@@ -609,15 +609,7 @@
           - socat
           - conntrack
           - ipset
-          - openvswitch         # Antrea CNI が必要とする Open vSwitch
-          - openvswitch-devel
         state: present
-
-    - name: Open vSwitch サービスを起動・有効化
-      systemd:
-        name: openvswitch
-        state: started
-        enabled: true
 
     - name: スワップの無効化
       shell: |
@@ -826,45 +818,41 @@
       args:
         chdir: /home/ec2-user
 
-    - name: Antrea CNI 適用（FlannelをAntreaに置き換え）
+    - name: Calico CNI マニフェストをダウンロード
       shell: |
-        KUBECONFIG=/home/ec2-user/admin.kubeconfig kubectl apply -f /home/ec2-user/templates/antrea.yml
+        curl -sL https://raw.githubusercontent.com/projectcalico/calico/v3.29.0/manifests/calico.yaml \
+          -o /home/ec2-user/templates/calico.yaml
       args:
         chdir: /home/ec2-user
 
-    - name: Antrea Podが起動するまで待機
+    - name: Calico の Pod CIDR をクラスター設定に合わせる（172.100.0.0/16）
       shell: |
-        KUBECONFIG=/home/ec2-user/admin.kubeconfig kubectl get pods -n kube-system -l app=antrea
-      register: antrea_status
-      until: "'Running' in antrea_status.stdout"
-      retries: 20
-      delay: 10
-      changed_when: false
+        sed -i 's|192.168.0.0/16|172.100.0.0/16|g' /home/ec2-user/templates/calico.yaml
+      args:
+        chdir: /home/ec2-user
 
-    - name: Antrea controller Pod が Ready になるまで待機（Webhook準備完了）
+    - name: Calico CNI 適用
+      shell: |
+        KUBECONFIG=/home/ec2-user/admin.kubeconfig kubectl apply -f /home/ec2-user/templates/calico.yaml
+      args:
+        chdir: /home/ec2-user
+
+    - name: calico-node DaemonSet が Ready になるまで待機
       shell: |
         KUBECONFIG=/home/ec2-user/admin.kubeconfig \
-          kubectl wait pod -n kube-system -l component=antrea-controller \
+          kubectl wait pod -n kube-system -l k8s-app=calico-node \
           --for=condition=Ready --timeout=30s
-      register: antrea_controller_ready
-      until: antrea_controller_ready.rc == 0
-      retries: 12
+      register: calico_ready
+      until: calico_ready.rc == 0
+      retries: 20
       delay: 15
       changed_when: false
 
-    - name: 標準 NetworkPolicy 適用（デフォルト拒否・DNS許可・同一NS許可）
+    - name: NetworkPolicy 適用（デフォルト拒否・DNS許可・同一NS許可・メタデータ保護）
       shell: |
         KUBECONFIG=/home/ec2-user/admin.kubeconfig kubectl apply -f /home/ec2-user/templates/network-policy-standard.yml
       args:
         chdir: /home/ec2-user
-
-    - name: Antrea ClusterNetworkPolicy 適用（kube-system保護・メタデータ保護）
-      shell: |
-        KUBECONFIG=/home/ec2-user/admin.kubeconfig kubectl apply -f /home/ec2-user/templates/network-policy-antrea.yml
-      args:
-        chdir: /home/ec2-user
-      retries: 5
-      delay: 10
 
     - name: ノードが Ready になるまで待機 (最大200秒)
       shell: kubectl get nodes

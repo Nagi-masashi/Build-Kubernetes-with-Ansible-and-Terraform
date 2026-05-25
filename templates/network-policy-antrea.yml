@@ -1,0 +1,48 @@
+---
+# =============================================================================
+# Antrea ClusterNetworkPolicy（Antrea controller Webhook が Ready になってから適用）
+# kubectl apply -f network-policy-antrea.yml --kubeconfig admin.kubeconfig
+# =============================================================================
+
+# ⑤ kube-system への外部 Namespace からのアクセスをブロック
+apiVersion: crd.antrea.io/v1beta1
+kind: ClusterNetworkPolicy
+metadata:
+  name: protect-kube-system
+spec:
+  priority: 1
+  tier: securityops
+  appliedTo:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+  ingress:
+    - action: Drop
+      from:
+        - namespaceSelector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: NotIn
+                values:
+                  - kube-system
+                  - default
+      name: block-external-to-kube-system
+
+---
+# ⑥ AWSメタデータサービス（169.254.169.254）へのアクセスをブロック
+#    （IAM認証情報漏洩リスクを防ぐ）
+apiVersion: crd.antrea.io/v1beta1
+kind: ClusterNetworkPolicy
+metadata:
+  name: block-metadata-service
+spec:
+  priority: 1
+  tier: securityops
+  appliedTo:
+    - podSelector: {}
+  egress:
+    - action: Drop
+      to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+      name: block-aws-metadata

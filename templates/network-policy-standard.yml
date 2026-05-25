@@ -1,0 +1,61 @@
+---
+# =============================================================================
+# 標準 Kubernetes NetworkPolicy（Antrea不要・即時適用可能）
+# kubectl apply -f network-policy-standard.yml --kubeconfig admin.kubeconfig
+# =============================================================================
+
+# ① デフォルト拒否：インバウンドを全拒否（Zero Trust の基本）
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: default
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+
+---
+# ② デフォルト拒否：アウトバウンドも全拒否
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: default
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+
+---
+# ③ DNS（UDP/TCP 53）だけ外部に許可
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: default
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# ④ 同一 Namespace 内の Pod 間通信を許可
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-same-namespace
+  namespace: default
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}

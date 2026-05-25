@@ -833,11 +833,27 @@
       delay: 10
       changed_when: false
 
-    - name: NetworkPolicy 適用（ゼロトラスト・メタデータ保護）
+    - name: Antrea controller の Deployment が Ready になるまで待機（Webhook準備完了）
       shell: |
-        KUBECONFIG=/home/ec2-user/admin.kubeconfig kubectl apply -f /home/ec2-user/templates/network-policy.yml
+        KUBECONFIG=/home/ec2-user/admin.kubeconfig \
+          kubectl rollout status deployment/antrea-controller -n kube-system --timeout=180s
       args:
         chdir: /home/ec2-user
+      changed_when: false
+
+    - name: 標準 NetworkPolicy 適用（デフォルト拒否・DNS許可・同一NS許可）
+      shell: |
+        KUBECONFIG=/home/ec2-user/admin.kubeconfig kubectl apply -f /home/ec2-user/templates/network-policy-standard.yml
+      args:
+        chdir: /home/ec2-user
+
+    - name: Antrea ClusterNetworkPolicy 適用（kube-system保護・メタデータ保護）
+      shell: |
+        KUBECONFIG=/home/ec2-user/admin.kubeconfig kubectl apply -f /home/ec2-user/templates/network-policy-antrea.yml
+      args:
+        chdir: /home/ec2-user
+      retries: 5
+      delay: 10
 
     - name: ノードが Ready になるまで待機 (最大200秒)
       shell: kubectl get nodes

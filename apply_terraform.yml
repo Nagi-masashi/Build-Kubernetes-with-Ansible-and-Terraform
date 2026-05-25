@@ -833,12 +833,15 @@
       delay: 10
       changed_when: false
 
-    - name: Antrea controller の Deployment が Ready になるまで待機（Webhook準備完了）
+    - name: Antrea controller Pod が Ready になるまで待機（Webhook準備完了）
       shell: |
         KUBECONFIG=/home/ec2-user/admin.kubeconfig \
-          kubectl rollout status deployment/antrea-controller -n kube-system --timeout=180s
-      args:
-        chdir: /home/ec2-user
+          kubectl wait pod -n kube-system -l component=antrea-controller \
+          --for=condition=Ready --timeout=30s
+      register: antrea_controller_ready
+      until: antrea_controller_ready.rc == 0
+      retries: 12
+      delay: 15
       changed_when: false
 
     - name: 標準 NetworkPolicy 適用（デフォルト拒否・DNS許可・同一NS許可）

@@ -609,7 +609,15 @@
           - socat
           - conntrack
           - ipset
+          - openvswitch         # Antrea CNI が必要とする Open vSwitch
+          - openvswitch-devel
         state: present
+
+    - name: Open vSwitch サービスを起動・有効化
+      systemd:
+        name: openvswitch
+        state: started
+        enabled: true
 
     - name: スワップの無効化
       shell: |

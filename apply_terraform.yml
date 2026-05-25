@@ -577,6 +577,8 @@
   hosts: worker_nodes
   become: yes  # 必要に応じてsudo権限
   vars:
+    # WorkerノードへのSSH鍵
+    ansible_ssh_private_key_file: "./ssh-key/teraform-key.pem"
     # Bastionを中継地点として指定する（ProxyJump）
     ansible_ssh_common_args: >
       -o ProxyCommand="ssh -i ./ssh-key/teraform-key.pem -W %h:%p -q ec2-user@{{ hostvars['localhost']['global_bastion_ip'] }} -o StrictHostKeyChecking=no"
@@ -816,11 +818,24 @@
       args:
         chdir: /home/ec2-user
 
-    - name: flannel適用
+    - name: Antrea CNI 適用（FlannelをAntreaに置き換え）
       shell: |
-        curl -sL https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml | \
-        sed 's|10.244.0.0/16|172.100.0.0/16|g' | \
-        KUBECONFIG=/home/ec2-user/admin.kubeconfig kubectl apply -f -
+        KUBECONFIG=/home/ec2-user/admin.kubeconfig kubectl apply -f /home/ec2-user/templates/antrea.yml
+      args:
+        chdir: /home/ec2-user
+
+    - name: Antrea Podが起動するまで待機
+      shell: |
+        KUBECONFIG=/home/ec2-user/admin.kubeconfig kubectl get pods -n kube-system -l app=antrea
+      register: antrea_status
+      until: "'Running' in antrea_status.stdout"
+      retries: 20
+      delay: 10
+      changed_when: false
+
+    - name: NetworkPolicy 適用（ゼロトラスト・メタデータ保護）
+      shell: |
+        KUBECONFIG=/home/ec2-user/admin.kubeconfig kubectl apply -f /home/ec2-user/templates/network-policy.yml
       args:
         chdir: /home/ec2-user
 

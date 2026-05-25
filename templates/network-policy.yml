@@ -1,0 +1,112 @@
+---
+# =============================================================================
+# Kubernetes NetworkPolicy サンプル（Antrea対応）
+# kubectl apply -f network-policy.yml --kubeconfig admin.kubeconfig
+# =============================================================================
+
+# ① デフォルト拒否：すべての Namespace でインバウンドを全拒否
+#    （明示的に許可したものだけ通す Zero Trust の基本）
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: default
+spec:
+  podSelector: {}       # Namespace 内の全 Pod に適用
+  policyTypes:
+    - Ingress
+
+---
+# ② デフォルト拒否：アウトバウンドも全拒否
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: default
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+
+---
+# ③ DNS（UDP/TCP 53）だけ外部に許可
+#    （DNSを止めると何も動かなくなるため必須）
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: default
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# ④ 同一 Namespace 内の Pod 間通信を許可
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-same-namespace
+  namespace: default
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}   # 同 Namespace の全 Pod から許可
+
+---
+# =============================================================================
+# Antrea 独自ポリシー（ClusterNetworkPolicy）
+# Namespace をまたいだクラスター全体のルール設定が可能
+# =============================================================================
+
+# ⑤ kube-system への不審なアクセスをブロック
+apiVersion: crd.antrea.io/v1beta1
+kind: ClusterNetworkPolicy
+metadata:
+  name: protect-kube-system
+spec:
+  priority: 1          # 数値が小さいほど優先度が高い
+  tier: securityops
+  appliedTo:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+  ingress:
+    - action: Drop
+      from:
+        - namespaceSelector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: NotIn
+                values:
+                  - kube-system
+                  - default
+      name: block-external-to-kube-system
+
+---
+# ⑥ ノードのメタデータサービス（169.254.169.254）へのアクセスをブロック
+#    （IAMロールの認証情報が漏洩するリスクを防ぐ）
+apiVersion: crd.antrea.io/v1beta1
+kind: ClusterNetworkPolicy
+metadata:
+  name: block-metadata-service
+spec:
+  priority: 1
+  tier: securityops
+  appliedTo:
+    - podSelector: {}
+  egress:
+    - action: Drop
+      to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+      name: block-aws-metadata
